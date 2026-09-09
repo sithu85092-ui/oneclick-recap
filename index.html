@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OneClick Recap AI</title>
+
+<style>
+:root{
+  --bg:#090b10;
+  --card:#11151d;
+  --card2:#171c26;
+  --text:#f4f7fb;
+  --muted:#9aa4b2;
+  --accent:#9b7cff;
+  --border:#28303c;
+}
+
+*{
+  box-sizing:border-box;
+}
+
+body{
+  margin:0;
+  background:radial-gradient(circle at top,#15112b,#090b10 42%);
+  color:var(--text);
+  font-family:system-ui,sans-serif;
+}
+
+.wrap{
+  width:min(920px,94%);
+  margin:auto;
+  padding:28px 0 50px;
+}
+
+header{
+  text-align:center;
+  margin-bottom:24px;
+}
+
+.logo{
+  width:62px;
+  height:62px;
+  margin:auto auto 12px;
+  border-radius:18px;
+  display:grid;
+  place-items:center;
+  font-size:28px;
+  font-weight:900;
+  background:linear-gradient(135deg,#9b7cff,#6c5ce7);
+}
+
+h1{
+  margin:0;
+  font-size:clamp(28px,6vw,44px);
+}
+
+header p{
+  color:var(--muted);
+}
+
+.card{
+  background:#11151df2;
+  border:1px solid var(--border);
+  border-radius:20px;
+  padding:20px;
+  margin-bottom:16px;
+}
+
+.drop{
+  border:1.5px dashed #485262;
+  border-radius:16px;
+  min-height:190px;
+  display:grid;
+  place-items:center;
+  text-align:center;
+  padding:22px;
+  cursor:pointer;
+}
+
+.drop input{
+  display:none;
+}
+
+.upload-icon{
+  font-size:42px;
+}
+
+.drop strong{
+  display:block;
+  font-size:18px;
+}
+
+.drop span{
+  display:block;
+  color:var(--muted);
+  margin-top:6px;
+}
+
+.file-name{
+  margin-top:12px;
+  padding:10px 12px;
+  background:var(--card2);
+  border-radius:10px;
+  word-break:break-word;
+  display:none;
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:14px;
+}
+
+label.title{
+  display:block;
+  font-size:13px;
+  color:var(--muted);
+  margin-bottom:7px;
+}
+
+select,
+button{
+  width:100%;
+  border:1px solid var(--border);
+  border-radius:11px;
+  background:var(--card2);
+  color:var(--text);
+  padding:12px;
+  font-size:15px;
+}
+
+button{
+  cursor:pointer;
+}
+
+.checks{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:10px;
+  margin-top:14px;
+}
+
+.check{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  background:var(--card2);
+  border:1px solid var(--border);
+  border-radius:11px;
+  padding:12px;
+}
+
+.check input{
+  width:18px;
+  height:18px;
+  accent-color:#9b7cff;
+}
+
+.primary{
+  margin-top:18px;
+  border:0;
+  font-weight:800;
+  background:linear-gradient(135deg,#9b7cff,#6c5ce7);
+}
+
+.primary:disabled{
+  opacity:.45;
+  cursor:not-allowed;
+}
+
+.secondary{
+  margin-top:10px;
+  background:transparent;
+}
+
+.status,
+.result{
+  display:none;
+}
+
+.status.show,
+.result.show{
+  display:block;
+}
+
+.bar{
+  height:10px;
+  background:#252c37;
+  border-radius:99px;
+  overflow:hidden;
+  margin:14px 0 10px;
+}
+
+.bar>div{
+  height:100%;
+  width:0;
+  background:linear-gradient(90deg,#6c5ce7,#9b7cff);
+  transition:width .35s;
+}
+
+.status-line{
+  color:var(--muted);
+  font-size:14px;
+}
+
+video{
+  width:100%;
+  max-height:620px;
+  border-radius:14px;
+  background:#000;
+}
+
+.actions{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+  margin-top:12px;
+}
+
+.download{
+  display:grid;
+  place-items:center;
+  text-decoration:none;
+  color:white;
+  background:#6c5ce7;
+  border-radius:11px;
+  font-weight:700;
+}
+
+.text-box{
+  margin-top:14px;
+  padding:14px;
+  background:var(--card2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  white-space:pre-wrap;
+  line-height:1.6;
+}
+
+.error{
+  display:none;
+  margin-top:12px;
+  color:#ffd9dd;
+  background:#ff6b7a18;
+  border:1px solid #ff6b7a55;
+  border-radius:11px;
+  padding:12px;
+}
+
+.error.show{
+  display:block;
+}
+
+.ok{
+  color:#38d996;
+}
+
+footer{
+  text-align:center;
+  color:#697382;
+  font-size:12px;
+  margin-top:18px;
+}
+
+@media(max-width:650px){
+  .grid,
+  .checks,
+  .actions{
+    grid-template-columns:1fr;
+  }
+
+  .card{
+    padding:15px;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<main class="wrap">
+
+<header>
+  <div class="logo">OC</div>
+  <h1>OneClick Recap AI</h1>
+  <p>Upload a video and create an AI-powered recap.</p>
+</header>
+
+
+<section class="card">
+
+<label class="drop" id="dropZone">
+
+<input
+  id="videoInput"
+  type="file"
+  accept="video/*"
+>
+
+<div>
+
+<div class="upload-icon">🎬</div>
+
+<strong>
+Tap to upload your video
+</strong>
+
+<span>
+MP4, MOV, WEBM and supported video formats
+</span>
+
+</div>
+
+</label>
+
+
+<div
+  class="file-name"
+  id="fileName">
+</div>
+
+</section>
+
+
+
+<section class="card">
+
+<div class="grid">
+
+
+<div>
+
+<label class="title">
+Recap Duration
+</label>
+
+<select id="duration">
+
+<option value="30">
+30 seconds
+</option>
+
+<option
+  value="60"
+  selected>
+60 seconds
+</option>
+
+<option value="90">
+90 seconds
+</option>
+
+</select>
+
+</div>
+
+
+
+<div>
+
+<label class="title">
+Video Format
+</label>
+
+<select id="format">
+
+<option
+  value="9:16"
+  selected>
+9:16 — TikTok / Reels / Shorts
+</option>
+
+<option value="16:9">
+16:9 — YouTube
+</option>
+
+<option value="1:1">
+1:1 — Square
+</option>
+
+</select>
+
+</div>
+
+
+
+<div>
+
+<label class="title">
+Language
+</label>
+
+<select id="language">
+
+<option
+  value="English"
+  selected>
+English
+</option>
+
+<option value="Burmese">
+Burmese
+</option>
+
+<option value="Japanese">
+Japanese
+</option>
+
+<option value="Chinese">
+Chinese
+</option>
+
+<option value="Korean">
+Korean
+</option>
+
+</select>
+
+</div>
+
+
+
+<div>
+
+<label class="title">
+Recap Style
+</label>
+
+<select id="style">
+
+<option
+  value="cinematic"
+  selected>
+Cinematic
+</option>
+
+<option value="documentary">
+Documentary
+</option>
+
+<option value="fast">
+Fast / Viral
+</option>
+
+<option value="storytelling">
+Storytelling
+</option>
+
+</select>
+
+</div>
+
+</div>
+
+
+
+<div class="checks">
+
+<label class="check">
+
+<input
+  id="aiVoice"
+  type="checkbox"
+  checked>
+
+<span>
+AI Voice
+</span>
+
+</label>
+
+
+<label class="check">
+
+<input
+  id="subtitles"
+  type="checkbox"
+  checked>
+
+<span>
+Subtitles
+</span>
+
+</label>
+
+</div>
+
+
+
+<button
+  class="primary"
+  id="createBtn"
+  disabled>
+
+ONE CLICK — CREATE RECAP
+
+</button>
+
+
+
+<button
+  class="secondary"
+  id="resetBtn"
+  type="button">
+
+Reset
+
+</button>
+
+
+
+<div
+  class="error"
+  id="errorBox">
+</div>
+
+</section>
+
+
+
+<section
+  class="card status"
+  id="statusCard">
+
+<strong id="statusTitle">
+Creating recap…
+</strong>
+
+
+<div class="bar">
+
+<div
+  id="progressBar">
+</div>
+
+</div>
+
+
+<div
+  class="status-line"
+  id="statusText">
+
+Starting…
+
+</div>
+
+</section>
+
+
+
+<section
+  class="card result"
+  id="resultCard">
+
+<h2 style="margin-top:0">
+Your Recap 🎉
+</h2>
+
+
+<div
+  id="resultTitle"
+  class="ok">
+</div>
+
+
+<video
+  id="resultVideo"
+  controls
+  playsinline>
+</video>
+
+
+
+<div class="actions">
+
+<a
+  id="downloadBtn"
+  class="download"
+  href="#"
+  download>
+
+Download Video
+
+</a>
+
+
+<button
+  id="newBtn"
+  type="button">
+
+Create Another
+
+</button>
+
+</div>
+
+
+
+<div class="text-box">
+
+<strong>
+Summary
+</strong>
+
+<div id="summaryText">
+</div>
+
+</div>
+
+
+
+<div class="text-box">
+
+<strong>
+Script / Narration
+</strong>
+
+<div id="scriptText">
+</div>
+
+</div>
+
+</section>
+
+
+
+<footer>
+OneClick Recap AI
+</footer>
+
+</main>
+
+
+
+<script>
+// @ts-nocheck
+
+const API_URL =
+  "https://oneclick-recap.onrender.com";
+
+
+const $ = id =>
+  document.getElementById(id);
+
+
+const videoInput =
+  $("videoInput");
+
+const dropZone =
+  $("dropZone");
+
+const fileName =
+  $("fileName");
+
+const createBtn =
+  $("createBtn");
+
+const errorBox =
+  $("errorBox");
+
+
+let selectedFile = null;
+
+let pollTimer = null;
+
+
+
+function showError(message){
+
+  errorBox.textContent =
+    message;
+
+  errorBox.classList.add(
+    "show"
+  );
+
+}
+
+
+
+function clearError(){
+
+  errorBox.textContent =
+    "";
+
+  errorBox.classList.remove(
+    "show"
+  );
+
+}
+
+
+
+function setFile(file){
+
+  clearError();
+
+  if(!file)
+    return;
+
+
+  if(!file.type.startsWith("video/")){
+
+    showError(
+      "Please select a video file."
+    );
+
+    return;
+  }
+
+
+  selectedFile = file;
+
+
+  fileName.textContent =
+    file.name +
+    " • " +
+    (file.size / 1048576).toFixed(1) +
+    " MB";
+
+
+  fileName.style.display =
+    "block";
+
+
+  createBtn.disabled =
+    false;
+
+}
+
+
+
+videoInput.onchange = () => {
+
+  setFile(
+    videoInput.files[0]
+  );
+
+};
+
+
+
+[
+  "dragenter",
+  "dragover"
+].forEach(eventName => {
+
+  dropZone.addEventListener(
+    eventName,
+    event => {
+
+      event.preventDefault();
+
+      dropZone.classList.add(
+        "drag"
+      );
+
+    }
+  );
+
+});
+
+
+
+[
+  "dragleave",
+  "drop"
+].forEach(eventName => {
+
+  dropZone.addEventListener(
+    eventName,
+    event => {
+
+      event.preventDefault();
+
+      dropZone.classList.remove(
+        "drag"
+      );
+
+    }
+  );
+
+});
+
+
+
+dropZone.ondrop = event => {
+
+  setFile(
+    event.dataTransfer.files[0]
+  );
+
+};
+
+
+
+function resetAll(){
+
+  if(pollTimer)
+    clearTimeout(pollTimer);
+
+
+  pollTimer = null;
+
+  selectedFile = null;
+
+
+  videoInput.value =
+    "";
+
+
+  fileName.style.display =
+    "none";
+
+
+  fileName.textContent =
+    "";
+
+
+  createBtn.disabled =
+    true;
+
+
+  $("statusCard")
+    .classList
+    .remove("show");
+
+
+  $("resultCard")
+    .classList
+    .remove("show");
+
+
+  $("resultVideo")
+    .removeAttribute("src");
+
+
+  $("resultVideo").load();
+
+
+  $("progressBar").style.width =
+    "0";
+
+
+  clearError();
+
+}
+
+
+
+$("resetBtn").onclick =
+  resetAll;
+
+
+$("newBtn").onclick =
+  resetAll;
+
+
+
+function absoluteUrl(value){
+
+  if(!value)
+    return "";
+
+
+  if(
+    /^https?:\/\//i.test(value)
+  ){
+
+    return value;
+
+  }
+
+
+  return (
+    API_URL.replace(/\/$/,"") +
+    "/" +
+    String(value)
+      .replace(/^\//,"")
+  );
+
+}
+
+
+
+async function createRecap(){
+
+  clearError();
+
+
+  if(!selectedFile){
+
+    showError(
+      "Please upload a video first."
+    );
+
+    return;
+
+  }
+
+
+
+  createBtn.disabled =
+    true;
+
+
+  $("statusCard")
+    .classList
+    .add("show");
+
+
+  $("resultCard")
+    .classList
+    .remove("show");
+
+
+  $("statusTitle")
+    .textContent =
+    "Uploading and creating recap…";
+
+
+  $("statusText")
+    .textContent =
+    "Starting job…";
+
+
+  $("progressBar")
+    .style.width =
+    "5%";
+
+
+
+  const formData =
+    new FormData();
+
+
+  formData.append(
+    "video",
+    selectedFile
+  );
+
+
+  formData.append(
+    "duration",
+    $("duration").value
+  );
+
+
+  formData.append(
+    "format",
+    $("format").value
+  );
+
+
+  formData.append(
+    "language",
+    $("language").value
+  );
+
+
+  formData.append(
+    "style",
+    $("style").value
+  );
+
+
+  formData.append(
+    "aiVoice",
+    $("aiVoice").checked
+      ? "true"
+      : "false"
+  );
+
+
+  formData.append(
+    "subtitles",
+    $("subtitles").checked
+      ? "true"
+      : "false"
+  );
+
+
+
+  try{
+
+    const response =
+      await fetch(
+        API_URL + "/api/recap",
+        {
+          method:"POST",
+          body:formData
+        }
+      );
+
+
+
+    const data =
+      await response
+        .json()
+        .catch(() => ({}));
+
+
+
+    if(!response.ok){
+
+      throw new Error(
+        data.error ||
+        "Server error (" +
+        response.status +
+        ")"
+      );
+
+    }
+
+
+
+    if(!data.jobId){
+
+      throw new Error(
+        "Server did not return a job ID."
+      );
+
+    }
+
+
+
+    pollStatus(
+      data.jobId
+    );
+
+
+
+  }catch(error){
+
+    $("statusCard")
+      .classList
+      .remove("show");
+
+
+    createBtn.disabled =
+      false;
+
+
+    showError(
+      error.message ||
+      "Could not create recap."
+    );
+
+  }
+
+}
+
+
+
+async function pollStatus(
+  jobId
+){
+
+  try{
+
+    const response =
+      await fetch(
+
+        API_URL +
+        "/api/recap/status/" +
+        encodeURIComponent(jobId),
+
+        {
+          cache:"no-store"
+        }
+
+      );
+
+
+
+    const data =
+      await response
+        .json()
+        .catch(() => ({}));
+
+
+
+    if(!response.ok){
+
+      throw new Error(
+
+        data.error ||
+        "Status error (" +
+        response.status +
+        ")"
+
+      );
+
+    }
+
+
+
+    const progress =
+      Number(
+        data.progress || 0
+      );
+
+
+
+    $("progressBar")
+      .style.width =
+
+      Math.max(
+        0,
+        Math.min(
+          100,
+          progress
+        )
+      ) + "%";
+
+
+
+    $("statusText")
+      .textContent =
+
+      data.message ||
+      "Processing…";
+
+
+
+    if(
+      data.status ===
+      "completed"
+    ){
+
+      showResult(
+        data
+      );
+
+      return;
+
+    }
+
+
+
+    if(
+      data.status ===
+      "failed"
+    ){
+
+      throw new Error(
+
+        data.error ||
+        "Recap generation failed."
+
+      );
+
+    }
+
+
+
+    pollTimer =
+      setTimeout(
+
+        () =>
+          pollStatus(jobId),
+
+        2000
+
+      );
+
+
+
+  }catch(error){
+
+    $("statusCard")
+      .classList
+      .remove("show");
+
+
+    createBtn.disabled =
+      false;
+
+
+    showError(
+
+      error.message ||
+      "Could not check job status."
+
+    );
+
+  }
+
+}
+
+
+
+function showResult(data){
+
+  const videoUrl =
+    absoluteUrl(
+      data.videoUrl
+    );
+
+
+
+  if(!videoUrl){
+
+    createBtn.disabled =
+      false;
+
+
+    showError(
+      "The server completed the job but did not return a video URL."
+    );
+
+    return;
+
+  }
+
+
+
+  $("statusTitle")
+    .textContent =
+    "Completed ✓";
+
+
+  $("progressBar")
+    .style.width =
+    "100%";
+
+
+
+  $("resultVideo")
+    .src =
+    videoUrl;
+
+
+  $("resultVideo").load();
+
+
+
+  $("downloadBtn")
+    .href =
+    videoUrl;
+
+
+
+  $("downloadBtn")
+    .download =
+
+    (
+      data.title ||
+      "oneclick-recap"
+    )
+    .replace(
+      /[^\w-]+/g,
+      "-"
+    ) +
+    ".mp4";
+
+
+
+  $("resultTitle")
+    .textContent =
+
+    data.title ||
+    "Recap ready";
+
+
+
+  $("summaryText")
+    .textContent =
+
+    data.summary ||
+    "No summary returned.";
+
+
+
+  $("scriptText")
+    .textContent =
+
+    data.script ||
+    "No script returned.";
+
+
+
+  $("resultCard")
+    .classList
+    .add("show");
+
+
+  createBtn.disabled =
+    false;
+
+
+
+  $("resultCard")
+    .scrollIntoView({
+      behavior:"smooth"
+    });
+
+}
+
+
+
+createBtn.onclick =
+  createRecap;
+
+</script>
+
+</body>
+</html>

@@ -5,7 +5,6 @@ RUN apt-get update \
        ffmpeg \
        fonts-noto-core \
        fonts-noto-cjk \
-       fonts-noto-unhinted \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

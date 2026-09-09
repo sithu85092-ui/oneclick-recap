@@ -1,7 +1,6 @@
 {
   "name": "oneclick-recap",
-  "version": "4.0.0",
-  "description": "AI Video Recap using Gemini and FFmpeg",
+  "version": "5.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -11,7 +10,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

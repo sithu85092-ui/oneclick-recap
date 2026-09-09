@@ -4,1802 +4,712 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import dotenv from "dotenv";
-import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { execFile } from "child_process";
-import { promisify } from "util";
 
 dotenv.config();
 
-const exec = promisify(execFile);
 const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const JSON2VIDEO_API =
+  "https://api.json2video.com/v2";
 
-/* =========================================================
-   CONFIG
-========================================================= */
+const JSON2VIDEO_API_KEY =
+  process.env.JSON2VIDEO_API_KEY;
 
-const VISION_MODEL =
-  process.env.VISION_MODEL || "gpt-5.6-luna";
-
-const TTS_MODEL =
-  process.env.TTS_MODEL || "gpt-4o-mini-tts";
-
-const TTS_VOICE =
-  process.env.TTS_VOICE || "alloy";
-
-const MAX_UPLOAD_SIZE =
-  Number(process.env.MAX_UPLOAD_MB || 500) * 1024 * 1024;
-
-
-/* =========================================================
-   FOLDERS
-========================================================= */
+if (!JSON2VIDEO_API_KEY) {
+  console.warn("WARNING: JSON2VIDEO_API_KEY is not configured.");
+}
 
 const ROOT = process.cwd();
 
 const UPLOAD_DIR = path.join(ROOT, "uploads");
-const OUTPUT_DIR = path.join(ROOT, "outputs");
-const WORK_DIR = path.join(ROOT, "work");
 
-for (const dir of [
-  UPLOAD_DIR,
-  OUTPUT_DIR,
-  WORK_DIR
-]) {
-  fs.mkdirSync(dir, {
-    recursive: true
-  });
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-
-/* =========================================================
-   MIDDLEWARE
-========================================================= */
-
-app.use(cors());
-
-app.use(express.json({
-  limit: "10mb"
-}));
-
-app.use(
-  "/outputs",
-  express.static(OUTPUT_DIR)
-);
-
-
-/* =========================================================
-   MULTER
-========================================================= */
-
-const storage = multer.diskStorage({
-
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-
-  filename: (_req, file, cb) => {
-
-    const ext =
-      path.extname(file.originalname) || ".mp4";
-
-    cb(
-      null,
-      crypto.randomUUID() + ext
-    );
-  }
-
-});
-
-
 const upload = multer({
-
-  storage,
-
+  dest: UPLOAD_DIR,
   limits: {
-    fileSize: MAX_UPLOAD_SIZE
+    fileSize: 500 * 1024 * 1024
   },
-
-  fileFilter: (_req, file, cb) => {
-
-    if (
-      file.mimetype &&
-      file.mimetype.startsWith("video/")
-    ) {
-      cb(null, true);
-    } else {
-      cb(
-        new Error(
-          "Only video files are allowed."
-        )
-      );
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("video/")) {
+      return cb(new Error("Only video files are allowed."));
     }
 
+    cb(null, true);
   }
-
 });
-
-
-/* =========================================================
-   JOB STORAGE
-========================================================= */
 
 const jobs = new Map();
 
+/* -------------------------------------------------------
+   Helpers
+------------------------------------------------------- */
 
-function createJob() {
-
-  const id =
-    crypto.randomUUID();
-
-  jobs.set(id, {
-
-    status: "queued",
-
-    progress: 0,
-
-    message: "Waiting..."
-
-  });
-
-  return id;
+function makeId() {
+  return crypto.randomUUID();
 }
 
-
-function updateJob(id, data) {
-
-  const old =
-    jobs.get(id) || {};
-
-  jobs.set(id, {
-
-    ...old,
-
-    ...data
-
-  });
-
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-
-/* =========================================================
-   SAFE NUMBER
-========================================================= */
-
-function safeNumber(value, fallback = 0) {
-
-  const number =
-    Number(value);
-
-  return Number.isFinite(number)
-    ? number
-    : fallback;
-}
-
-
-/* =========================================================
-   FFMPEG HELPERS
-========================================================= */
-
-async function getDuration(file) {
-
-  const { stdout } =
-    await exec(
-      "ffprobe",
-      [
-        "-v",
-        "error",
-
-        "-show_entries",
-        "format=duration",
-
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-
-        file
-      ]
-    );
-
-  const duration =
-    Number(stdout.trim());
-
-  if (!Number.isFinite(duration)) {
-    throw new Error(
-      "Could not read video duration."
-    );
-  }
-
-  return duration;
-}
-
-
-/* =========================================================
-   EXTRACT AUDIO
-========================================================= */
-
-async function extractAudio(
-  video,
-  output
-) {
-
-  await exec(
-    "ffmpeg",
-    [
-      "-y",
-
-      "-i",
-      video,
-
-      "-vn",
-
-      "-ac",
-      "1",
-
-      "-ar",
-      "16000",
-
-      "-c:a",
-      "mp3",
-
-      output
-    ]
-  );
-}
-
-
-/* =========================================================
-   TRANSCRIPTION
-========================================================= */
-
-async function transcribe(audio) {
-
-  const result =
-    await openai.audio.transcriptions.create({
-
-      file:
-        fs.createReadStream(audio),
-
-      model:
-        process.env.TRANSCRIBE_MODEL ||
-        "gpt-4o-mini-transcribe"
-
-    });
-
-  return result.text || "";
-}
-
-
-/* =========================================================
-   EXTRACT FRAMES
-========================================================= */
-
-async function extractFrames(
-  video,
-  duration,
-  workDir
-) {
-
-  const count =
-    Math.min(
-      16,
-      Math.max(
-        6,
-        Math.ceil(duration / 20)
-      )
-    );
-
-  const interval =
-    duration / count;
-
-  const frames = [];
-
-  for (
-    let i = 0;
-    i < count;
-    i++
-  ) {
-
-    const time =
-      Math.min(
-        Math.max(0, duration - 0.2),
-        i * interval
-      );
-
-    const output =
-      path.join(
-        workDir,
-        `frame-${i}.jpg`
-      );
-
-    await exec(
-      "ffmpeg",
-      [
-        "-y",
-
-        "-ss",
-        String(time),
-
-        "-i",
-        video,
-
-        "-frames:v",
-        "1",
-
-        "-vf",
-        "scale=640:-1",
-
-        "-q:v",
-        "4",
-
-        output
-      ]
-    );
-
-    frames.push({
-
-      time,
-
-      file: output,
-
-      index: i
-
-    });
-  }
-
-  return frames;
-}
-
-
-/* =========================================================
-   IMAGE → DATA URL
-========================================================= */
-
-function imageToDataURL(file) {
-
-  const data =
-    fs.readFileSync(file);
-
-  return (
-    "data:image/jpeg;base64," +
-    data.toString("base64")
-  );
-}
-
-
-/* =========================================================
-   LANGUAGE
-========================================================= */
-
-function languageName(language) {
-
-  const languages = {
-
-    en: "English",
-
-    english: "English",
-
-    my: "Burmese",
-
-    burmese: "Burmese",
-
-    ja: "Japanese",
-
-    japanese: "Japanese",
-
-    zh: "Chinese",
-
-    chinese: "Chinese",
-
-    ko: "Korean",
-
-    korean: "Korean"
-
+function json2videoHeaders() {
+  return {
+    "x-api-key": JSON2VIDEO_API_KEY,
+    "Content-Type": "application/json"
   };
-
-  return (
-    languages[
-      String(language || "")
-        .toLowerCase()
-    ] || "English"
-  );
 }
 
+function getResolution(format) {
+  switch (format) {
+    case "9:16":
+      return {
+        width: 1080,
+        height: 1920
+      };
 
-/* =========================================================
-   STYLE
-========================================================= */
+    case "1:1":
+      return {
+        width: 1080,
+        height: 1080
+      };
 
-function styleDescription(style) {
-
-  const styles = {
-
-    cinematic:
-      "cinematic, dramatic and emotional",
-
-    documentary:
-      "professional documentary style",
-
-    fast:
-      "fast-paced, energetic and engaging",
-
-    storytelling:
-      "natural storytelling style"
-
-  };
-
-  return (
-    styles[style] ||
-    styles.cinematic
-  );
+    case "16:9":
+    default:
+      return {
+        width: 1920,
+        height: 1080
+      };
+  }
 }
 
+function getResolutionName(format) {
+  switch (format) {
+    case "9:16":
+      return "full-hd";
 
-/* =========================================================
-   AI VIDEO ANALYSIS
-========================================================= */
+    case "1:1":
+      return "full-hd";
 
-async function analyzeVideo({
+    case "16:9":
+    default:
+      return "full-hd";
+  }
+}
 
-  frames,
+/*
+  JSON2Video voice names.
 
-  transcript,
+  These are examples of Azure voices supported by JSON2Video.
+  The language selected by the frontend is mapped here.
+*/
 
-  duration,
+function getVoice(language) {
+  switch (language) {
+    case "Burmese":
+      return {
+        voice: "my-MM-NilarNeural",
+        model: "azure"
+      };
 
-  target,
+    case "Japanese":
+      return {
+        voice: "ja-JP-NanamiNeural",
+        model: "azure"
+      };
 
+    case "Chinese":
+      return {
+        voice: "zh-CN-XiaoxiaoNeural",
+        model: "azure"
+      };
+
+    case "Korean":
+      return {
+        voice: "ko-KR-SunHiNeural",
+        model: "azure"
+      };
+
+    case "English":
+    default:
+      return {
+        voice: "en-US-JennyNeural",
+        model: "azure"
+      };
+  }
+}
+
+/*
+  Since there is no OpenAI summarizer anymore,
+  we generate a simple title/description from the
+  user's selected options.
+
+  This is NOT AI summarization.
+*/
+
+function createBasicText({
   language,
-
-  style
-
+  style,
+  duration
 }) {
+  const text = {
+    English:
+      `Video recap — ${duration} seconds — ${style} style.`,
 
-  const outputLanguage =
-    languageName(language);
+    Burmese:
+      `ဗီဒီယို အကျဉ်းချုပ် — ${duration} စက္ကန့် — ${style} ပုံစံ။`,
 
-  const styleText =
-    styleDescription(style);
+    Japanese:
+      `ビデオリキャップ — ${duration}秒 — ${style}スタイル。`,
 
-  const content = [];
+    Chinese:
+      `视频摘要 — ${duration} 秒 — ${style} 风格。`,
 
-  content.push({
+    Korean:
+      `영상 요약 — ${duration}초 — ${style} 스타일。`
+  };
 
-    type: "input_text",
-
-    text: `
-
-You are an expert short-form video editor.
-
-Analyze the provided video frames and transcript.
-
-Original video duration:
-${duration} seconds
-
-Target recap duration:
-${target} seconds
-
-Output language:
-${outputLanguage}
-
-Style:
-${styleText}
-
-Transcript:
-${String(transcript || "")
-  .slice(0, 30000)}
-
-Choose the most important and interesting moments.
-
-Rules:
-
-- Choose several non-overlapping scenes.
-- Every scene must have start and end.
-- Timestamps must be inside the original video.
-- Prefer visually meaningful moments.
-- Avoid empty or repetitive sections.
-- Keep the selected scenes close to the target duration.
-- The narration must match the selected scenes.
-- Write the narration in ${outputLanguage}.
-- Keep narration concise enough for the target duration.
-- Return valid JSON only.
-
-Required JSON:
-
-{
-  "title": "short title",
-  "summary": "short summary",
-  "narration": "short narration",
-  "scenes": [
-    {
-      "start": 0,
-      "end": 5,
-      "reason": "why this scene matters"
-    }
-  ]
+  return text[language] || text.English;
 }
 
-`
+/* -------------------------------------------------------
+   JSON2Video media upload
+------------------------------------------------------- */
 
+async function uploadToJSON2Video(filePath, originalName, mimeType) {
+  const stat = fs.statSync(filePath);
+
+  if (stat.size <= 0) {
+    throw new Error("Uploaded video is empty.");
+  }
+
+  if (stat.size > 500 * 1024 * 1024) {
+    throw new Error("Video is larger than JSON2Video's 500 MB limit.");
+  }
+
+  const cleanName =
+    String(originalName || "video.mp4")
+      .replace(/[^a-zA-Z0-9._-]/g, "_");
+
+  /* Step 1: request presigned upload URL */
+
+  const createResponse = await fetch(
+    `${JSON2VIDEO_API}/media/file`,
+    {
+      method: "POST",
+      headers: json2videoHeaders(),
+      body: JSON.stringify({
+        name: `${Date.now()}_${cleanName}`,
+        contentType: mimeType || "video/mp4",
+        size: stat.size,
+        folder: "temp"
+      })
+    }
+  );
+
+  const createText = await createResponse.text();
+
+  let createData;
+
+  try {
+    createData = JSON.parse(createText);
+  } catch {
+    throw new Error(
+      `JSON2Video media response was not JSON: ${createText.slice(0, 500)}`
+    );
+  }
+
+  if (!createResponse.ok || !createData.uploadUrl) {
+    throw new Error(
+      createData.message ||
+      createData.error ||
+      `JSON2Video media upload setup failed (${createResponse.status})`
+    );
+  }
+
+  /* Step 2: upload actual file to presigned URL */
+
+  const fileBuffer = fs.readFileSync(filePath);
+
+  const uploadResponse = await fetch(
+    createData.uploadUrl,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": mimeType || "video/mp4"
+      },
+      body: fileBuffer
+    }
+  );
+
+  if (!uploadResponse.ok) {
+    const uploadError = await uploadResponse.text();
+
+    throw new Error(
+      `JSON2Video file upload failed (${uploadResponse.status}): ${uploadError.slice(0, 500)}`
+    );
+  }
+
+  return createData.fileUrl;
+}
+
+/* -------------------------------------------------------
+   Create JSON2Video movie
+------------------------------------------------------- */
+
+async function createMovie({
+  sourceUrl,
+  duration,
+  format,
+  language,
+  style,
+  aiVoice,
+  subtitles
+}) {
+  const resolution = getResolution(format);
+
+  const sceneElements = [];
+
+  /*
+    Main source video.
+    seek = 0
+    duration = requested output duration
+  */
+
+  sceneElements.push({
+    type: "video",
+    src: sourceUrl,
+    seek: 0,
+    duration: duration,
+    position: "center-center",
+    resize: "cover",
+    volume: 1
   });
 
+  /*
+    Optional voice.
+    Because OpenAI is removed, this uses
+    JSON2Video's voice element.
+  */
 
-  for (const frame of frames) {
+  if (aiVoice) {
+    const voice = getVoice(language);
 
-    content.push({
-
-      type: "input_text",
-
-      text:
-        `FRAME ${frame.index}
-TIMESTAMP ${frame.time.toFixed(2)} seconds`
-
+    sceneElements.push({
+      type: "voice",
+      voice: voice.voice,
+      model: voice.model,
+      text: createBasicText({
+        language,
+        style,
+        duration
+      }),
+      duration: duration,
+      volume: 1
     });
-
-
-    content.push({
-
-      type: "input_image",
-
-      image_url:
-        imageToDataURL(
-          frame.file
-        ),
-
-      detail: "low"
-
-    });
-
   }
 
+  const movie = {
+    resolution: "full-hd",
 
-  const response =
-    await openai.responses.create({
+    width: resolution.width,
+    height: resolution.height,
 
-      model:
-        VISION_MODEL,
+    fps: 30,
 
-      input: [
+    cache: false,
 
-        {
+    "client-data": {
+      source: "oneclick-recap",
+      language,
+      style,
+      duration,
+      format
+    },
 
-          role: "user",
-
-          content
-
-        }
-
-      ],
-
-      text: {
-
-        format: {
-
-          type: "json_object"
-
-        }
-
+    scenes: [
+      {
+        duration,
+        elements: sceneElements
       }
+    ]
+  };
 
-    });
+  /*
+    Automatic subtitles must be movie-level.
+    JSON2Video transcribes the movie audio and burns
+    subtitles onto the video.
+  */
 
+  if (subtitles && aiVoice) {
+    movie.elements = [
+      {
+        type: "subtitles",
+        language: "auto",
+        model: "default",
 
-  const text =
-    response.output_text || "";
+        settings: {
+          "font-family": "Roboto",
+          "font-size": 56,
+          "font-weight": "900",
+          "max-words-per-line": 5,
+          "all-caps": false,
+          style: "classic",
+          position: "bottom-center",
+          "outline-width": 5
+        }
+      }
+    ];
+  }
 
+  const response = await fetch(
+    `${JSON2VIDEO_API}/movies`,
+    {
+      method: "POST",
+      headers: json2videoHeaders(),
+      body: JSON.stringify(movie)
+    }
+  );
 
-  let result;
+  const text = await response.text();
+
+  let data;
 
   try {
-
-    result =
-      JSON.parse(text);
-
+    data = JSON.parse(text);
   } catch {
-
     throw new Error(
-      "AI returned invalid JSON."
+      `JSON2Video movie response was not JSON: ${text.slice(0, 500)}`
     );
-
   }
 
-
-  if (
-    !result ||
-    !Array.isArray(result.scenes)
-  ) {
-
+  if (!response.ok || !data.project) {
     throw new Error(
-      "AI response does not contain scenes."
+      data.message ||
+      data.error ||
+      `JSON2Video movie creation failed (${response.status})`
     );
-
   }
 
-
-  return result;
+  return data.project;
 }
 
+/* -------------------------------------------------------
+   Poll JSON2Video
+------------------------------------------------------- */
 
-/* =========================================================
-   CLEAN / VALIDATE SCENES
-========================================================= */
+async function waitForMovie(projectId, jobId) {
+  const maxAttempts = 240;
 
-function normalizeScenes(
-  scenes,
-  sourceDuration,
-  targetDuration
-) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
 
-  const valid = [];
-
-  for (const scene of scenes || []) {
-
-    let start =
-      safeNumber(scene.start);
-
-    let end =
-      safeNumber(scene.end);
-
-    start =
-      Math.max(
-        0,
-        Math.min(
-          start,
-          sourceDuration
-        )
-      );
-
-    end =
-      Math.max(
-        start + 0.5,
-        Math.min(
-          end,
-          sourceDuration
-        )
-      );
-
-    if (
-      end > start &&
-      start < sourceDuration
-    ) {
-
-      valid.push({
-
-        start,
-
-        end,
-
-        reason:
-          String(
-            scene.reason || ""
-          )
-
-      });
-
-    }
-
-  }
-
-
-  valid.sort(
-    (a, b) =>
-      a.start - b.start
-  );
-
-
-  const output = [];
-
-  let total = 0;
-
-  for (const scene of valid) {
-
-    if (total >= targetDuration) {
-      break;
-    }
-
-    const remaining =
-      targetDuration - total;
-
-    const sceneDuration =
-      scene.end - scene.start;
-
-    const take =
-      Math.min(
-        sceneDuration,
-        remaining
-      );
-
-    if (take < 0.5) {
-      continue;
-    }
-
-    output.push({
-
-      start:
-        scene.start,
-
-      end:
-        scene.start + take,
-
-      reason:
-        scene.reason
-
-    });
-
-    total += take;
-
-  }
-
-
-  if (!output.length) {
-
-    throw new Error(
-      "No valid scenes were returned by AI."
+    const response = await fetch(
+      `${JSON2VIDEO_API}/movies?project=${encodeURIComponent(projectId)}`,
+      {
+        method: "GET",
+        headers: {
+          "x-api-key": JSON2VIDEO_API_KEY
+        }
+      }
     );
 
-  }
+    const text = await response.text();
 
-
-  return output;
-}
-
-
-/* =========================================================
-   TTS
-========================================================= */
-
-async function createVoice(
-  text,
-  output,
-  language,
-  style
-) {
-
-  const languageText =
-    languageName(language);
-
-  const styleText =
-    styleDescription(style);
-
-
-  const speech =
-    await openai.audio.speech.create({
-
-      model:
-        TTS_MODEL,
-
-      voice:
-        TTS_VOICE,
-
-      input:
-        String(text || "")
-          .slice(0, 4096),
-
-      instructions:
-        `Speak naturally in ${languageText}.
-Style: ${styleText}.
-Clear, engaging short-form narrator voice.
-Do not add extra words.`,
-
-      response_format:
-        "mp3"
-
-    });
-
-
-  const buffer =
-    Buffer.from(
-      await speech.arrayBuffer()
-    );
-
-
-  fs.writeFileSync(
-    output,
-    buffer
-  );
-}
-
-
-/* =========================================================
-   VIDEO FORMAT
-========================================================= */
-
-function videoFilter(format) {
-
-  if (format === "16:9") {
-
-    return [
-      "scale=1280:720:force_original_aspect_ratio=increase",
-      "crop=1280:720"
-    ].join(",");
-
-  }
-
-
-  if (format === "1:1") {
-
-    return [
-      "scale=1080:1080:force_original_aspect_ratio=increase",
-      "crop=1080:1080"
-    ].join(",");
-
-  }
-
-
-  return [
-    "scale=1080:1920:force_original_aspect_ratio=increase",
-    "crop=1080:1920"
-  ].join(",");
-}
-
-
-/* =========================================================
-   CREATE CLIPS
-========================================================= */
-
-async function createClips(
-  video,
-  scenes,
-  workDir,
-  format
-) {
-
-  const clips = [];
-
-  for (
-    let i = 0;
-    i < scenes.length;
-    i++
-  ) {
-
-    const scene =
-      scenes[i];
-
-    const start =
-      Math.max(
-        0,
-        safeNumber(scene.start)
-      );
-
-    const end =
-      Math.max(
-        start + 0.5,
-        safeNumber(scene.end)
-      );
-
-    const output =
-      path.join(
-        workDir,
-        `clip-${i}.mp4`
-      );
-
-
-    await exec(
-      "ffmpeg",
-      [
-        "-y",
-
-        "-ss",
-        String(start),
-
-        "-i",
-        video,
-
-        "-t",
-        String(end - start),
-
-        "-vf",
-        videoFilter(format),
-
-        "-an",
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "23",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-r",
-        "30",
-
-        output
-
-      ]
-    );
-
-
-    clips.push(output);
-
-  }
-
-
-  return clips;
-}
-
-
-/* =========================================================
-   CONCAT CLIPS
-========================================================= */
-
-async function concatClips(
-  clips,
-  output
-) {
-
-  const listFile =
-    output + ".txt";
-
-
-  const content =
-    clips
-      .map(
-        file =>
-          `file '${file.replace(
-            /'/g,
-            "'\\''"
-          )}'`
-      )
-      .join("\n");
-
-
-  fs.writeFileSync(
-    listFile,
-    content
-  );
-
-
-  try {
-
-    await exec(
-      "ffmpeg",
-      [
-        "-y",
-
-        "-f",
-        "concat",
-
-        "-safe",
-        "0",
-
-        "-i",
-        listFile,
-
-        "-c",
-        "copy",
-
-        output
-      ]
-    );
-
-  } finally {
+    let data;
 
     try {
-      fs.unlinkSync(listFile);
-    } catch {}
-
-  }
-
-}
-
-
-/* =========================================================
-   ADD VOICE
-========================================================= */
-
-async function addVoice(
-  video,
-  voice,
-  output
-) {
-
-  await exec(
-    "ffmpeg",
-    [
-      "-y",
-
-      "-i",
-      video,
-
-      "-i",
-      voice,
-
-      "-map",
-      "0:v:0",
-
-      "-map",
-      "1:a:0",
-
-      "-c:v",
-      "copy",
-
-      "-c:a",
-      "aac",
-
-      "-b:a",
-      "128k",
-
-      "-shortest",
-
-      output
-
-    ]
-  );
-}
-
-
-/* =========================================================
-   AUDIO DURATION
-========================================================= */
-
-async function getAudioDuration(file) {
-
-  try {
-
-    return await getDuration(file);
-
-  } catch {
-
-    return 0;
-
-  }
-
-}
-
-
-/* =========================================================
-   SUBTITLE FILE
-========================================================= */
-
-function createSRT(
-  narration,
-  duration,
-  output
-) {
-
-  const sentences =
-    String(narration || "")
-      .split(
-        /(?<=[.!?။])\s+/
-      )
-      .map(
-        x => x.trim()
-      )
-      .filter(Boolean);
-
-
-  if (!sentences.length) {
-    return;
-  }
-
-
-  const segment =
-    duration /
-    sentences.length;
-
-
-  function timecode(seconds) {
-
-    const ms =
-      Math.floor(
-        (seconds % 1) * 1000
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Invalid JSON2Video status response: ${text.slice(0, 500)}`
       );
+    }
 
-    const total =
-      Math.floor(seconds);
+    if (!response.ok) {
+      throw new Error(
+        data.message ||
+        data.error ||
+        `JSON2Video status request failed (${response.status})`
+      );
+    }
 
-    const s =
-      total % 60;
+    const movie = data.movie;
 
-    const m =
-      Math.floor(total / 60) % 60;
+    if (!movie) {
+      throw new Error("JSON2Video did not return movie status.");
+    }
 
-    const h =
-      Math.floor(total / 3600);
+    const status = movie.status;
 
+    if (jobs.has(jobId)) {
+      jobs.get(jobId).status =
+        status === "done"
+          ? "completed"
+          : status === "error" || status === "timeout"
+            ? "error"
+            : "rendering";
+    }
 
-    return (
+    if (status === "done") {
+      return movie;
+    }
 
-      String(h).padStart(2, "0") +
-      ":" +
-      String(m).padStart(2, "0") +
-      ":" +
-      String(s).padStart(2, "0") +
-      "," +
-      String(ms).padStart(3, "0")
+    if (status === "error") {
+      throw new Error(
+        movie.message ||
+        "JSON2Video rendering failed."
+      );
+    }
 
-    );
+    if (status === "timeout") {
+      throw new Error(
+        "JSON2Video rendering timed out."
+      );
+    }
 
+    await sleep(5000);
   }
 
-
-  let srt = "";
-
-
-  sentences.forEach(
-    (sentence, i) => {
-
-      const start =
-        i * segment;
-
-      const end =
-        Math.min(
-          duration,
-          (i + 1) * segment
-        );
-
-
-      srt +=
-        `${i + 1}\n` +
-        `${timecode(start)} --> ${timecode(end)}\n` +
-        `${sentence}\n\n`;
-
-    }
-  );
-
-
-  fs.writeFileSync(
-    output,
-    srt,
-    "utf8"
-  );
-
-}
-
-
-/* =========================================================
-   ADD SUBTITLES
-========================================================= */
-
-async function addSubtitles(
-  video,
-  srt,
-  output
-) {
-
-  const escaped =
-    srt
-      .replace(/\\/g, "\\\\")
-      .replace(/:/g, "\\:")
-      .replace(/'/g, "\\'");
-
-
-  await exec(
-    "ffmpeg",
-    [
-      "-y",
-
-      "-i",
-      video,
-
-      "-vf",
-
-      `subtitles='${escaped}':force_style='FontName=Arial,FontSize=18,Outline=2,Alignment=2,MarginV=80'`,
-
-      "-c:v",
-      "libx264",
-
-      "-preset",
-      "veryfast",
-
-      "-crf",
-      "23",
-
-      "-pix_fmt",
-      "yuv420p",
-
-      "-c:a",
-      "aac",
-
-      "-b:a",
-      "128k",
-
-      output
-
-    ]
+  throw new Error(
+    "JSON2Video rendering took too long."
   );
 }
 
-
-/* =========================================================
-   CLEAN DIRECTORY
-========================================================= */
-
-function removeDirectory(dir) {
-
-  try {
-
-    fs.rmSync(
-      dir,
-      {
-        recursive: true,
-        force: true
-      }
-    );
-
-  } catch {}
-
-}
-
-
-/* =========================================================
-   MAIN PROCESS
-========================================================= */
+/* -------------------------------------------------------
+   Process
+------------------------------------------------------- */
 
 async function processRecap({
-
   jobId,
-
-  video,
-
-  durationTarget,
-
+  filePath,
+  originalName,
+  mimeType,
+  duration,
   format,
-
   language,
-
   style,
-
-  subtitles = true,
-
-  aiVoice = true
-
+  aiVoice,
+  subtitles
 }) {
-
-  const workDir =
-    path.join(
-      WORK_DIR,
-      jobId
-    );
-
-
-  fs.mkdirSync(
-    workDir,
-    {
-      recursive: true
-    }
-  );
-
-
   try {
 
-    /* ---------------------------------------------
-       1. READ VIDEO
-    --------------------------------------------- */
+    jobs.set(jobId, {
+      ...jobs.get(jobId),
 
-    updateJob(
-      jobId,
-      {
-        status: "processing",
-        progress: 5,
-        message: "Reading video..."
-      }
-    );
+      status: "uploading",
 
+      progress: 10
+    });
 
-    const duration =
-      await getDuration(video);
+    /* Upload source video to JSON2Video */
 
-
-    if (duration < 1) {
-
-      throw new Error(
-        "Video is too short."
+    const sourceUrl =
+      await uploadToJSON2Video(
+        filePath,
+        originalName,
+        mimeType
       );
 
-    }
+    jobs.set(jobId, {
+      ...jobs.get(jobId),
 
+      status: "creating",
+      progress: 25,
 
-    /* ---------------------------------------------
-       2. EXTRACT AUDIO
-    --------------------------------------------- */
+      sourceUrl
+    });
 
-    updateJob(
-      jobId,
-      {
-        progress: 12,
-        message: "Extracting audio..."
-      }
-    );
+    /* Create movie */
 
-
-    const audio =
-      path.join(
-        workDir,
-        "audio.mp3"
-      );
-
-
-    await extractAudio(
-      video,
-      audio
-    );
-
-
-    /* ---------------------------------------------
-       3. TRANSCRIBE
-    --------------------------------------------- */
-
-    updateJob(
-      jobId,
-      {
-        progress: 25,
-        message: "Transcribing audio..."
-      }
-    );
-
-
-    const transcript =
-      await transcribe(audio);
-
-
-    /* ---------------------------------------------
-       4. FRAMES
-    --------------------------------------------- */
-
-    updateJob(
-      jobId,
-      {
-        progress: 38,
-        message: "Extracting video frames..."
-      }
-    );
-
-
-    const frames =
-      await extractFrames(
-        video,
+    const projectId =
+      await createMovie({
+        sourceUrl,
         duration,
-        workDir
-      );
-
-
-    /* ---------------------------------------------
-       5. AI ANALYSIS
-    --------------------------------------------- */
-
-    updateJob(
-      jobId,
-      {
-        progress: 52,
-        message:
-          "AI is selecting the best scenes..."
-      }
-    );
-
-
-    const analysis =
-      await analyzeVideo({
-
-        frames,
-
-        transcript,
-
-        duration,
-
-        target:
-          Number(durationTarget),
-
+        format,
         language,
-
-        style
-
+        style,
+        aiVoice,
+        subtitles
       });
 
+    jobs.set(jobId, {
+      ...jobs.get(jobId),
 
-    const scenes =
-      normalizeScenes(
-        analysis.scenes,
-        duration,
-        Number(durationTarget)
+      status: "rendering",
+      progress: 35,
+
+      projectId
+    });
+
+    /* Wait for render */
+
+    const movie =
+      await waitForMovie(
+        projectId,
+        jobId
       );
 
+    jobs.set(jobId, {
+      ...jobs.get(jobId),
 
-    /* ---------------------------------------------
-       6. CUT CLIPS
-    --------------------------------------------- */
+      status: "completed",
+      progress: 100,
 
-    updateJob(
-      jobId,
-      {
-        progress: 65,
-        message:
-          "Cutting selected scenes..."
-      }
-    );
+      videoUrl: movie.url,
 
-
-    const clips =
-      await createClips(
-        video,
-        scenes,
-        workDir,
-        format
-      );
-
-
-    const rawRecap =
-      path.join(
-        workDir,
-        "recap.mp4"
-      );
-
-
-    await concatClips(
-      clips,
-      rawRecap
-    );
-
-
-    let currentVideo =
-      rawRecap;
-
-
-    /* ---------------------------------------------
-       7. AI VOICE
-    --------------------------------------------- */
-
-    if (aiVoice) {
-
-      updateJob(
-        jobId,
-        {
-          progress: 75,
-          message:
-            "Generating AI voice..."
-        }
-      );
-
-
-      if (
-        analysis.narration &&
-        analysis.narration.trim()
-      ) {
-
-        const voice =
-          path.join(
-            workDir,
-            "voice.mp3"
-          );
-
-
-        await createVoice(
-          analysis.narration,
-          voice,
+      summary:
+        createBasicText({
           language,
-          style
-        );
+          style,
+          duration
+        }),
 
-
-        const narrated =
-          path.join(
-            workDir,
-            "narrated.mp4"
-          );
-
-
-        await addVoice(
-          currentVideo,
-          voice,
-          narrated
-        );
-
-
-        currentVideo =
-          narrated;
-
-      }
-
-    }
-
-
-    /* ---------------------------------------------
-       8. SUBTITLES
-    --------------------------------------------- */
-
-    updateJob(
-      jobId,
-      {
-        progress: 88,
-        message:
-          "Creating final video..."
-      }
-    );
-
-
-    let finalFile =
-      path.join(
-        OUTPUT_DIR,
-        `${jobId}.mp4`
-      );
-
-
-    if (
-      subtitles &&
-      analysis.narration &&
-      analysis.narration.trim()
-    ) {
-
-      const srt =
-        path.join(
-          workDir,
-          "subtitles.srt"
-        );
-
-
-      const subtitleDuration =
+      script:
         aiVoice
-          ? await getAudioDuration(
-              path.join(
-                workDir,
-                "voice.mp3"
-              )
-            )
-          : Number(durationTarget);
+          ? createBasicText({
+              language,
+              style,
+              duration
+            })
+          : "AI voice disabled.",
 
+      projectId,
 
-      createSRT(
-        analysis.narration,
-        Math.max(
-          1,
-          subtitleDuration ||
-            Number(durationTarget)
-        ),
-        srt
-      );
-
-
-      await addSubtitles(
-        currentVideo,
-        srt,
-        finalFile
-      );
-
-    } else {
-
-      fs.copyFileSync(
-        currentVideo,
-        finalFile
-      );
-
-    }
-
-
-    /* ---------------------------------------------
-       9. COMPLETE
-    --------------------------------------------- */
-
-    updateJob(
-      jobId,
-      {
-
-        status:
-          "completed",
-
-        progress:
-          100,
-
-        message:
-          "Completed!",
-
-        videoUrl:
-          `/outputs/${jobId}.mp4`,
-
-        script:
-          analysis.narration || "",
-
-        title:
-          analysis.title || "Video Recap",
-
-        summary:
-          analysis.summary || ""
-
-      }
-    );
-
+      json2video: movie
+    });
 
   } catch (error) {
 
     console.error(
-      "JOB ERROR:",
+      `[${jobId}]`,
       error
     );
 
+    jobs.set(jobId, {
+      ...jobs.get(jobId),
 
-    updateJob(
-      jobId,
-      {
+      status: "error",
+      progress: 100,
 
-        status:
-          "failed",
-
-        progress:
-          0,
-
-        message:
-          error?.message ||
-          "Failed",
-
-        error:
-          error?.message ||
-          "Unknown error"
-
-      }
-    );
-
+      error:
+        error?.message ||
+        String(error)
+    });
 
   } finally {
 
-    /* Remove uploaded source */
+    /*
+      Delete temporary upload from Render.
+    */
 
     try {
-
-      if (
-        fs.existsSync(video)
-      ) {
-        fs.unlinkSync(video);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
       }
-
-    } catch {}
-
-
-    /* Remove work files */
-
-    removeDirectory(
-      workDir
-    );
-
+    } catch {
+      // ignore cleanup errors
+    }
   }
-
 }
 
-
-/* =========================================================
-   CREATE RECAP
-========================================================= */
+/* -------------------------------------------------------
+   POST /api/recap
+------------------------------------------------------- */
 
 app.post(
   "/api/recap",
-
   upload.single("video"),
-
   async (req, res) => {
 
     try {
 
-      if (!req.file) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Video is required."
-
-          });
-
+      if (!JSON2VIDEO_API_KEY) {
+        return res.status(500).json({
+          error:
+            "JSON2VIDEO_API_KEY is not configured on Render."
+        });
       }
 
+      if (!req.file) {
+        return res.status(400).json({
+          error: "Please upload a video."
+        });
+      }
+
+      const jobId = makeId();
+
+      const requestedDuration =
+        Number(req.body.duration || 30);
 
       const duration =
-        Number(
-          req.body.duration || 60
-        );
-
+        [30, 60, 90].includes(requestedDuration)
+          ? requestedDuration
+          : 30;
 
       const format =
-        req.body.format ||
-        "9:16";
-
+        req.body.format || "9:16";
 
       const language =
-        req.body.language ||
-        "en";
-
+        req.body.language || "English";
 
       const style =
-        req.body.style ||
-        "cinematic";
-
-
-      const subtitles =
-        String(
-          req.body.subtitles ?? "true"
-        ) !== "false";
-
+        req.body.style || "cinematic";
 
       const aiVoice =
-        String(
-          req.body.aiVoice ?? "true"
-        ) !== "false";
+        String(req.body.aiVoice) === "true";
 
+      const subtitles =
+        String(req.body.subtitles) === "true";
 
-      if (
-        ![30, 60, 90]
-          .includes(duration)
-      ) {
-
-        try {
-          fs.unlinkSync(
-            req.file.path
-          );
-        } catch {}
-
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Duration must be 30, 60 or 90 seconds."
-
-          });
-
-      }
-
-
-      if (
-        ![
-          "9:16",
-          "16:9",
-          "1:1"
-        ].includes(format)
-      ) {
-
-        try {
-          fs.unlinkSync(
-            req.file.path
-          );
-        } catch {}
-
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Invalid video format."
-
-          });
-
-      }
-
-
-      const jobId =
-        createJob();
-
-
-      res.json({
-
+      jobs.set(jobId, {
         jobId,
 
-        status:
-          "queued"
+        status: "queued",
 
+        progress: 0,
+
+        videoUrl: null,
+
+        summary: null,
+
+        script: null,
+
+        error: null,
+
+        createdAt: Date.now()
       });
 
-
-      processRecap({
+      res.json({
+        success: true,
 
         jobId,
 
-        video:
-          req.file.path,
+        message:
+          "Video uploaded. JSON2Video rendering started."
+      });
 
-        durationTarget:
-          duration,
+      processRecap({
+        jobId,
+
+        filePath: req.file.path,
+
+        originalName:
+          req.file.originalname,
+
+        mimeType:
+          req.file.mimetype,
+
+        duration,
 
         format,
 
@@ -1807,185 +717,130 @@ app.post(
 
         style,
 
-        subtitles,
+        aiVoice,
 
-        aiVoice
-
+        subtitles
       });
 
     } catch (error) {
 
-      console.error(
-        "CREATE ERROR:",
-        error
-      );
+      console.error(error);
 
-
-      if (req.file) {
-
+      if (req.file?.path) {
         try {
-          fs.unlinkSync(
-            req.file.path
-          );
+          fs.unlinkSync(req.file.path);
         } catch {}
-
       }
 
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error?.message ||
-            "Server error."
-
-        });
-
+      res.status(500).json({
+        error:
+          error?.message ||
+          "Failed to create recap."
+      });
     }
-
   }
 );
 
-
-/* =========================================================
-   JOB STATUS
-========================================================= */
+/* -------------------------------------------------------
+   GET /api/recap/status/:jobId
+------------------------------------------------------- */
 
 app.get(
   "/api/recap/status/:jobId",
-
   (req, res) => {
 
     const job =
-      jobs.get(
-        req.params.jobId
-      );
-
+      jobs.get(req.params.jobId);
 
     if (!job) {
-
-      return res
-        .status(404)
-        .json({
-
-          error:
-            "Job not found."
-
-        });
-
+      return res.status(404).json({
+        error: "Job not found."
+      });
     }
-
-
-    res.json(job);
-
-  }
-);
-
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-  "/",
-  (_req, res) => {
 
     res.json({
+      success: true,
 
-      ok: true,
+      jobId: job.jobId,
 
-      service:
-        "OneClick Recap AI",
+      status: job.status,
 
-      version:
-        "2.0.0",
+      progress:
+        job.progress ?? 0,
 
-      models: {
+      videoUrl:
+        job.videoUrl || null,
 
-        vision:
-          VISION_MODEL,
+      summary:
+        job.summary || null,
 
-        transcription:
-          process.env.TRANSCRIBE_MODEL ||
-          "gpt-4o-mini-transcribe",
+      script:
+        job.script || null,
 
-        tts:
-          TTS_MODEL
+      error:
+        job.error || null,
 
-      }
-
+      projectId:
+        job.projectId || null
     });
-
   }
 );
 
+/* -------------------------------------------------------
+   Health
+------------------------------------------------------- */
 
-/* =========================================================
+app.get("/", (req, res) => {
+
+  res.json({
+    ok: true,
+
+    service:
+      "OneClick Recap AI",
+
+    version:
+      "3.0.0-json2video",
+
+    engine:
+      "JSON2Video",
+
+    openai:
+      false,
+
+    json2video:
+      Boolean(JSON2VIDEO_API_KEY)
+  });
+});
+
+/* -------------------------------------------------------
    404
-========================================================= */
+------------------------------------------------------- */
 
-app.use(
-  (_req, res) => {
+app.use((req, res) => {
 
-    res
-      .status(404)
-      .json({
+  res.status(404).json({
+    error: "Not found"
+  });
+});
 
-        error:
-          "Route not found."
+/* -------------------------------------------------------
+   Error handler
+------------------------------------------------------- */
 
-      });
+app.use((error, req, res, next) => {
 
-  }
-);
+  console.error(error);
 
-
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
-
-app.use(
-  (error, _req, res, _next) => {
-
-    console.error(
-      "SERVER ERROR:",
-      error
-    );
-
-
-    let message =
+  res.status(500).json({
+    error:
       error?.message ||
-      "Server error";
+      "Server error"
+  });
+});
 
-
-    if (
-      error?.code ===
-      "LIMIT_FILE_SIZE"
-    ) {
-
-      message =
-        "Video file is too large. Maximum size is 500MB.";
-
-    }
-
-
-    res
-      .status(500)
-      .json({
-
-        error:
-          message
-
-      });
-
-  }
-);
-
-
-/* =========================================================
-   START
-========================================================= */
+/* -------------------------------------------------------
+   Start
+------------------------------------------------------- */
 
 app.listen(
   PORT,
@@ -1993,16 +848,11 @@ app.listen(
   () => {
 
     console.log(
-      `OneClick Recap running on port ${PORT}`
+      `OneClick Recap JSON2Video server running on port ${PORT}`
     );
 
     console.log(
-      `Vision model: ${VISION_MODEL}`
+      `JSON2Video configured: ${Boolean(JSON2VIDEO_API_KEY)}`
     );
-
-    console.log(
-      `TTS model: ${TTS_MODEL}`
-    );
-
   }
 );

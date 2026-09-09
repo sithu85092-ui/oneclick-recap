@@ -7,6 +7,14 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+import {
+  GoogleGenAI,
+  createUserContent,
+  createPartFromUri
+} from "@google/genai";
 
 dotenv.config();
 
@@ -17,32 +25,49 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 
-const JSON2VIDEO_API =
-  "https://api.json2video.com/v2";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const JSON2VIDEO_API_KEY =
-  process.env.JSON2VIDEO_API_KEY;
-
-if (!JSON2VIDEO_API_KEY) {
-  console.warn("WARNING: JSON2VIDEO_API_KEY is not configured.");
-}
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 const ROOT = process.cwd();
 
 const UPLOAD_DIR = path.join(ROOT, "uploads");
+const OUTPUT_DIR = path.join(ROOT, "outputs");
+const WORK_DIR = path.join(ROOT, "work");
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+for (const dir of [
+  UPLOAD_DIR,
+  OUTPUT_DIR,
+  WORK_DIR
+]) {
+  fs.mkdirSync(dir, { recursive: true });
 }
+
+if (!GEMINI_API_KEY) {
+  console.warn("WARNING: GEMINI_API_KEY is missing.");
+}
+
+const ai = GEMINI_API_KEY
+  ? new GoogleGenAI({
+      apiKey: GEMINI_API_KEY
+    })
+  : null;
+
+const execFileAsync = promisify(execFile);
 
 const upload = multer({
   dest: UPLOAD_DIR,
+
   limits: {
-    fileSize: 500 * 1024 * 1024
+    fileSize: 2 * 1024 * 1024 * 1024
   },
+
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith("video/")) {
-      return cb(new Error("Only video files are allowed."));
+      return cb(
+        new Error("Only video files are allowed.")
+      );
     }
 
     cb(null, true);
@@ -51,448 +76,786 @@ const upload = multer({
 
 const jobs = new Map();
 
-/* -------------------------------------------------------
-   Helpers
-------------------------------------------------------- */
+/* =====================================================
+   HELPERS
+===================================================== */
+
+function sleep(ms) {
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
+}
 
 function makeId() {
   return crypto.randomUUID();
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+
+  return Number.isFinite(n)
+    ? n
+    : fallback;
 }
 
-function json2videoHeaders() {
-  return {
-    "x-api-key": JSON2VIDEO_API_KEY,
-    "Content-Type": "application/json"
-  };
-}
-
-function getResolution(format) {
-  switch (format) {
-    case "9:16":
-      return {
-        width: 1080,
-        height: 1920
-      };
-
-    case "1:1":
-      return {
-        width: 1080,
-        height: 1080
-      };
-
-    case "16:9":
-    default:
-      return {
-        width: 1920,
-        height: 1080
-      };
-  }
-}
-
-function getResolutionName(format) {
-  switch (format) {
-    case "9:16":
-      return "full-hd";
-
-    case "1:1":
-      return "full-hd";
-
-    case "16:9":
-    default:
-      return "full-hd";
-  }
-}
-
-/*
-  JSON2Video voice names.
-
-  These are examples of Azure voices supported by JSON2Video.
-  The language selected by the frontend is mapped here.
-*/
-
-function getVoice(language) {
-  switch (language) {
-    case "Burmese":
-      return {
-        voice: "my-MM-NilarNeural",
-        model: "azure"
-      };
-
-    case "Japanese":
-      return {
-        voice: "ja-JP-NanamiNeural",
-        model: "azure"
-      };
-
-    case "Chinese":
-      return {
-        voice: "zh-CN-XiaoxiaoNeural",
-        model: "azure"
-      };
-
-    case "Korean":
-      return {
-        voice: "ko-KR-SunHiNeural",
-        model: "azure"
-      };
-
-    case "English":
-    default:
-      return {
-        voice: "en-US-JennyNeural",
-        model: "azure"
-      };
-  }
-}
-
-/*
-  Since there is no OpenAI summarizer anymore,
-  we generate a simple title/description from the
-  user's selected options.
-
-  This is NOT AI summarization.
-*/
-
-function createBasicText({
-  language,
-  style,
-  duration
-}) {
-  const text = {
-    English:
-      `Video recap — ${duration} seconds — ${style} style.`,
-
-    Burmese:
-      `ဗီဒီယို အကျဉ်းချုပ် — ${duration} စက္ကန့် — ${style} ပုံစံ။`,
-
-    Japanese:
-      `ビデオリキャップ — ${duration}秒 — ${style}スタイル。`,
-
-    Chinese:
-      `视频摘要 — ${duration} 秒 — ${style} 风格。`,
-
-    Korean:
-      `영상 요약 — ${duration}초 — ${style} 스타일。`
-  };
-
-  return text[language] || text.English;
-}
-
-/* -------------------------------------------------------
-   JSON2Video media upload
-------------------------------------------------------- */
-
-async function uploadToJSON2Video(filePath, originalName, mimeType) {
-  const stat = fs.statSync(filePath);
-
-  if (stat.size <= 0) {
-    throw new Error("Uploaded video is empty.");
-  }
-
-  if (stat.size > 500 * 1024 * 1024) {
-    throw new Error("Video is larger than JSON2Video's 500 MB limit.");
-  }
-
-  const cleanName =
-    String(originalName || "video.mp4")
-      .replace(/[^a-zA-Z0-9._-]/g, "_");
-
-  /* Step 1: request presigned upload URL */
-
-  const createResponse = await fetch(
-    `${JSON2VIDEO_API}/media/file`,
-    {
-      method: "POST",
-      headers: json2videoHeaders(),
-      body: JSON.stringify({
-        name: `${Date.now()}_${cleanName}`,
-        contentType: mimeType || "video/mp4",
-        size: stat.size,
-        folder: "temp"
-      })
-    }
+async function ffprobeDuration(file) {
+  const { stdout } = await execFileAsync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      file
+    ]
   );
 
-  const createText = await createResponse.text();
-
-  let createData;
-
-  try {
-    createData = JSON.parse(createText);
-  } catch {
-    throw new Error(
-      `JSON2Video media response was not JSON: ${createText.slice(0, 500)}`
-    );
-  }
-
-  if (!createResponse.ok || !createData.uploadUrl) {
-    throw new Error(
-      createData.message ||
-      createData.error ||
-      `JSON2Video media upload setup failed (${createResponse.status})`
-    );
-  }
-
-  /* Step 2: upload actual file to presigned URL */
-
-  const fileBuffer = fs.readFileSync(filePath);
-
-  const uploadResponse = await fetch(
-    createData.uploadUrl,
-    {
-      method: "PUT",
-      headers: {
-        "Content-Type": mimeType || "video/mp4"
-      },
-      body: fileBuffer
-    }
+  const duration = Number(
+    String(stdout).trim()
   );
 
-  if (!uploadResponse.ok) {
-    const uploadError = await uploadResponse.text();
-
+  if (!Number.isFinite(duration)) {
     throw new Error(
-      `JSON2Video file upload failed (${uploadResponse.status}): ${uploadError.slice(0, 500)}`
+      "Could not detect video duration."
     );
   }
 
-  return createData.fileUrl;
+  return duration;
 }
 
-/* -------------------------------------------------------
-   Create JSON2Video movie
-------------------------------------------------------- */
+function cleanGeminiText(text) {
+  let value = String(text || "").trim();
 
-async function createMovie({
-  sourceUrl,
-  duration,
-  format,
-  language,
-  style,
-  aiVoice,
-  subtitles
-}) {
-  const resolution = getResolution(format);
+  value = value
+    .replace(/^```json/i, "")
+    .replace(/^```/i, "")
+    .replace(/```$/i, "")
+    .trim();
 
-  const sceneElements = [];
+  return value;
+}
 
-  /*
-    Main source video.
-    seek = 0
-    duration = requested output duration
-  */
+function clamp(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
+}
 
-  sceneElements.push({
-    type: "video",
-    src: sourceUrl,
-    seek: 0,
-    duration: duration,
-    position: "center-center",
-    resize: "cover",
-    volume: 1
-  });
+/* =====================================================
+   GEMINI VIDEO ANALYSIS
+===================================================== */
 
-  /*
-    Optional voice.
-    Because OpenAI is removed, this uses
-    JSON2Video's voice element.
-  */
+async function uploadVideoToGemini(filePath, mimeType) {
 
-  if (aiVoice) {
-    const voice = getVoice(language);
+  if (!ai) {
+    throw new Error(
+      "GEMINI_API_KEY is not configured."
+    );
+  }
 
-    sceneElements.push({
-      type: "voice",
-      voice: voice.voice,
-      model: voice.model,
-      text: createBasicText({
-        language,
-        style,
-        duration
-      }),
-      duration: duration,
-      volume: 1
+  console.log(
+    "Uploading video to Gemini..."
+  );
+
+  const uploaded =
+    await ai.files.upload({
+      file: filePath,
+      config: {
+        mimeType:
+          mimeType || "video/mp4"
+      }
     });
+
+  if (!uploaded?.name) {
+    throw new Error(
+      "Gemini video upload failed."
+    );
   }
 
-  const movie = {
-    resolution: "full-hd",
+  console.log(
+    "Gemini file:",
+    uploaded.name
+  );
 
-    width: resolution.width,
-    height: resolution.height,
+  let videoFile = uploaded;
 
-    fps: 30,
+  let attempts = 0;
 
-    cache: false,
+  while (
+    videoFile.state &&
+    String(videoFile.state) === "PROCESSING"
+  ) {
 
-    "client-data": {
-      source: "oneclick-recap",
+    attempts++;
+
+    if (attempts > 120) {
+      throw new Error(
+        "Gemini video processing timed out."
+      );
+    }
+
+    await sleep(3000);
+
+    videoFile =
+      await ai.files.get({
+        name: uploaded.name
+      });
+
+    console.log(
+      "Gemini video state:",
+      videoFile.state
+    );
+  }
+
+  if (
+    String(videoFile.state) === "FAILED"
+  ) {
+    throw new Error(
+      "Gemini failed to process the video."
+    );
+  }
+
+  return videoFile;
+}
+
+/* =====================================================
+   GEMINI RECAP PROMPT
+===================================================== */
+
+function buildRecapPrompt({
+  targetDuration,
+  language,
+  style,
+  sourceDuration
+}) {
+
+  return `
+You are the AI editor for OneClick Recap.
+
+Analyze the entire uploaded video.
+
+SOURCE VIDEO DURATION:
+${sourceDuration.toFixed(2)} seconds
+
+TARGET RECAP DURATION:
+${targetDuration} seconds
+
+LANGUAGE:
+${language}
+
+STYLE:
+${style}
+
+Your job is to create a REAL video recap.
+
+IMPORTANT:
+- Do NOT simply describe the whole video.
+- Select the most important and interesting moments.
+- Return precise timestamps for the clips.
+- Clips must be taken from the original video.
+- Avoid repeated or boring scenes.
+- Prefer visually meaningful moments.
+- The total selected clip duration should be close to ${targetDuration} seconds.
+- Each clip should normally be 2 to 12 seconds.
+- Do not select timestamps outside the source video.
+- Do not invent events that are not visible/audible.
+- Create a short narration/script based ONLY on what happens in the video.
+- Create subtitle segments.
+- Keep the final recap engaging.
+
+Return ONLY valid JSON.
+
+Required JSON structure:
+
+{
+  "title": "short recap title",
+  "summary": "short summary",
+  "clips": [
+    {
+      "start": 0.0,
+      "end": 5.0,
+      "reason": "why this moment matters"
+    }
+  ],
+  "narration": [
+    {
+      "start": 0.0,
+      "end": 5.0,
+      "text": "narration for this section"
+    }
+  ]
+}
+
+Rules:
+- clips must contain real timestamps.
+- narration timestamps must fit inside the selected recap timeline.
+- Keep narration concise.
+- For Burmese, write natural Burmese.
+- For English, write natural English.
+- For Japanese, write natural Japanese.
+- For Chinese, write natural Chinese.
+- For Korean, write natural Korean.
+`;
+}
+
+/* =====================================================
+   GEMINI ANALYSIS
+===================================================== */
+
+async function analyzeVideo({
+  videoFile,
+  targetDuration,
+  language,
+  style,
+  sourceDuration
+}) {
+
+  console.log(
+    "Sending video to Gemini..."
+  );
+
+  const prompt =
+    buildRecapPrompt({
+      targetDuration,
       language,
       style,
-      duration,
-      format
-    },
+      sourceDuration
+    });
 
-    scenes: [
-      {
-        duration,
-        elements: sceneElements
-      }
-    ]
-  };
+  const response =
+    await ai.models.generateContent({
+      model: GEMINI_MODEL,
 
-  /*
-    Automatic subtitles must be movie-level.
-    JSON2Video transcribes the movie audio and burns
-    subtitles onto the video.
-  */
+      contents:
+        createUserContent([
+          createPartFromUri(
+            videoFile.uri,
+            videoFile.mimeType
+          ),
 
-  if (subtitles && aiVoice) {
-    movie.elements = [
-      {
-        type: "subtitles",
-        language: "auto",
-        model: "default",
+          prompt
+        ])
+    });
 
-        settings: {
-          "font-family": "Roboto",
-          "font-size": 56,
-          "font-weight": "900",
-          "max-words-per-line": 5,
-          "all-caps": false,
-          style: "classic",
-          position: "bottom-center",
-          "outline-width": 5
-        }
-      }
-    ];
-  }
+  const raw =
+    cleanGeminiText(
+      response.text
+    );
 
-  const response = await fetch(
-    `${JSON2VIDEO_API}/movies`,
-    {
-      method: "POST",
-      headers: json2videoHeaders(),
-      body: JSON.stringify(movie)
-    }
+  console.log(
+    "Gemini response:",
+    raw.slice(0, 2000)
   );
 
-  const text = await response.text();
-
-  let data;
+  let result;
 
   try {
-    data = JSON.parse(text);
+    result = JSON.parse(raw);
   } catch {
-    throw new Error(
-      `JSON2Video movie response was not JSON: ${text.slice(0, 500)}`
-    );
+
+    const match =
+      raw.match(/\{[\s\S]*\}/);
+
+    if (!match) {
+      throw new Error(
+        "Gemini returned invalid recap JSON."
+      );
+    }
+
+    result =
+      JSON.parse(match[0]);
   }
 
-  if (!response.ok || !data.project) {
-    throw new Error(
-      data.message ||
-      data.error ||
-      `JSON2Video movie creation failed (${response.status})`
-    );
-  }
-
-  return data.project;
+  return result;
 }
 
-/* -------------------------------------------------------
-   Poll JSON2Video
-------------------------------------------------------- */
+/* =====================================================
+   NORMALIZE CLIPS
+===================================================== */
 
-async function waitForMovie(projectId, jobId) {
-  const maxAttempts = 240;
+function normalizeClips(
+  clips,
+  sourceDuration,
+  targetDuration
+) {
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-
-    const response = await fetch(
-      `${JSON2VIDEO_API}/movies?project=${encodeURIComponent(projectId)}`,
-      {
-        method: "GET",
-        headers: {
-          "x-api-key": JSON2VIDEO_API_KEY
-        }
-      }
+  if (!Array.isArray(clips)) {
+    throw new Error(
+      "Gemini did not return video clips."
     );
-
-    const text = await response.text();
-
-    let data;
-
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(
-        `Invalid JSON2Video status response: ${text.slice(0, 500)}`
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        data.message ||
-        data.error ||
-        `JSON2Video status request failed (${response.status})`
-      );
-    }
-
-    const movie = data.movie;
-
-    if (!movie) {
-      throw new Error("JSON2Video did not return movie status.");
-    }
-
-    const status = movie.status;
-
-    if (jobs.has(jobId)) {
-      jobs.get(jobId).status =
-        status === "done"
-          ? "completed"
-          : status === "error" || status === "timeout"
-            ? "error"
-            : "rendering";
-    }
-
-    if (status === "done") {
-      return movie;
-    }
-
-    if (status === "error") {
-      throw new Error(
-        movie.message ||
-        "JSON2Video rendering failed."
-      );
-    }
-
-    if (status === "timeout") {
-      throw new Error(
-        "JSON2Video rendering timed out."
-      );
-    }
-
-    await sleep(5000);
   }
 
-  throw new Error(
-    "JSON2Video rendering took too long."
+  const cleaned = [];
+
+  for (const clip of clips) {
+
+    let start =
+      safeNumber(clip.start);
+
+    let end =
+      safeNumber(clip.end);
+
+    start =
+      clamp(
+        start,
+        0,
+        Math.max(0, sourceDuration - 0.2)
+      );
+
+    end =
+      clamp(
+        end,
+        start + 0.5,
+        sourceDuration
+      );
+
+    if (end > start) {
+
+      cleaned.push({
+        start,
+        end,
+        reason:
+          String(
+            clip.reason || ""
+          )
+      });
+    }
+  }
+
+  if (!cleaned.length) {
+    throw new Error(
+      "No valid recap clips were returned."
+    );
+  }
+
+  /*
+    Limit to requested output duration.
+  */
+
+  const selected = [];
+
+  let total = 0;
+
+  for (const clip of cleaned) {
+
+    const length =
+      clip.end - clip.start;
+
+    if (
+      total + length <=
+      targetDuration + 1
+    ) {
+
+      selected.push(clip);
+
+      total += length;
+    }
+  }
+
+  /*
+    If Gemini selected too little,
+    add additional clips when available.
+  */
+
+  if (
+    selected.length === 0
+  ) {
+    selected.push(
+      cleaned[0]
+    );
+  }
+
+  return selected;
+}
+
+/* =====================================================
+   CREATE CLIPS WITH FFMPEG
+===================================================== */
+
+async function createClip(
+  input,
+  output,
+  start,
+  end
+) {
+
+  const duration =
+    Math.max(
+      0.5,
+      end - start
+    );
+
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+
+      "-ss",
+      String(start),
+
+      "-i",
+      input,
+
+      "-t",
+      String(duration),
+
+      "-map",
+      "0:v:0",
+
+      "-map",
+      "0:a?",
+
+      "-c:v",
+      "libx264",
+
+      "-preset",
+      "veryfast",
+
+      "-crf",
+      "23",
+
+      "-c:a",
+      "aac",
+
+      "-ar",
+      "48000",
+
+      "-ac",
+      "2",
+
+      "-movflags",
+      "+faststart",
+
+      output
+    ],
+    {
+      maxBuffer:
+        10 * 1024 * 1024
+    }
   );
 }
 
-/* -------------------------------------------------------
-   Process
-------------------------------------------------------- */
+/* =====================================================
+   CONCAT CLIPS
+===================================================== */
+
+async function concatClips(
+  clips,
+  output
+) {
+
+  const listFile =
+    output + ".txt";
+
+  const content =
+    clips
+      .map(file => {
+        const escaped =
+          file.replace(
+            /'/g,
+            "'\\''"
+          );
+
+        return `file '${escaped}'`;
+      })
+      .join("\n");
+
+  fs.writeFileSync(
+    listFile,
+    content
+  );
+
+  try {
+
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+
+        "-f",
+        "concat",
+
+        "-safe",
+        "0",
+
+        "-i",
+        listFile,
+
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        output
+      ],
+      {
+        maxBuffer:
+          10 * 1024 * 1024
+      }
+    );
+
+  } finally {
+
+    try {
+      fs.unlinkSync(
+        listFile
+      );
+    } catch {}
+  }
+}
+
+/* =====================================================
+   SRT
+===================================================== */
+
+function formatSrtTime(seconds) {
+
+  seconds =
+    Math.max(
+      0,
+      Number(seconds) || 0
+    );
+
+  const hours =
+    Math.floor(
+      seconds / 3600
+    );
+
+  const minutes =
+    Math.floor(
+      (seconds % 3600) / 60
+    );
+
+  const secs =
+    Math.floor(
+      seconds % 60
+    );
+
+  const ms =
+    Math.floor(
+      (seconds -
+        Math.floor(seconds)) *
+        1000
+    );
+
+  return [
+    String(hours).padStart(2, "0"),
+
+    String(minutes).padStart(2, "0"),
+
+    String(secs).padStart(2, "0")
+  ].join(":") +
+    "," +
+    String(ms).padStart(3, "0");
+}
+
+function createSrt(
+  narration,
+  clips
+) {
+
+  if (
+    !Array.isArray(narration) ||
+    !narration.length
+  ) {
+    return "";
+  }
+
+  const entries = [];
+
+  /*
+    Gemini narration timestamps may correspond
+    to the recap timeline.
+
+    We clamp them to the final video.
+  */
+
+  for (
+    let i = 0;
+    i < narration.length;
+    i++
+  ) {
+
+    const item =
+      narration[i];
+
+    let start =
+      safeNumber(item.start);
+
+    let end =
+      safeNumber(item.end);
+
+    if (
+      end <= start
+    ) {
+      continue;
+    }
+
+    const text =
+      String(
+        item.text || ""
+      ).trim();
+
+    if (!text) {
+      continue;
+    }
+
+    entries.push(
+      [
+        String(
+          entries.length + 1
+        ),
+
+        `${formatSrtTime(start)} --> ${formatSrtTime(end)}`,
+
+        text,
+
+        ""
+      ].join("\n")
+    );
+  }
+
+  return entries.join("\n");
+}
+
+/* =====================================================
+   BURN SUBTITLES
+===================================================== */
+
+async function burnSubtitles(
+  input,
+  srtFile,
+  output,
+  format
+) {
+
+  /*
+    Use Noto fonts installed in Docker.
+  */
+
+  const subtitleFilter =
+    `subtitles=${srtFile.replace(
+      /\\/g,
+      "\\\\"
+    ).replace(
+      /:/g,
+      "\\:"
+    )}:force_style='FontName=Noto Sans Myanmar,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=55'`;
+
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+
+      "-i",
+      input,
+
+      "-vf",
+      subtitleFilter,
+
+      "-c:v",
+      "libx264",
+
+      "-preset",
+      "veryfast",
+
+      "-crf",
+      "23",
+
+      "-c:a",
+      "aac",
+
+      "-movflags",
+      "+faststart",
+
+      output
+    ],
+    {
+      maxBuffer:
+        10 * 1024 * 1024
+    }
+  );
+}
+
+/* =====================================================
+   FORMAT VIDEO
+===================================================== */
+
+async function formatVideo(
+  input,
+  output,
+  format
+) {
+
+  let vf;
+
+  if (format === "9:16") {
+
+    vf =
+      "scale=1080:1920:force_original_aspect_ratio=decrease," +
+      "pad=1080:1920:(ow-iw)/2:(oh-ih)/2";
+
+  } else if (
+    format === "1:1"
+  ) {
+
+    vf =
+      "scale=1080:1080:force_original_aspect_ratio=decrease," +
+      "pad=1080:1080:(ow-iw)/2:(oh-ih)/2";
+
+  } else {
+
+    vf =
+      "scale=1920:1080:force_original_aspect_ratio=decrease," +
+      "pad=1920:1080:(ow-iw)/2:(oh-ih)/2";
+  }
+
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+
+      "-i",
+      input,
+
+      "-vf",
+      vf,
+
+      "-c:v",
+      "libx264",
+
+      "-preset",
+      "veryfast",
+
+      "-crf",
+      "23",
+
+      "-c:a",
+      "aac",
+
+      "-movflags",
+      "+faststart",
+
+      output
+    ],
+    {
+      maxBuffer:
+        10 * 1024 * 1024
+    }
+  );
+}
+
+/* =====================================================
+   PROCESS RECAP
+===================================================== */
 
 async function processRecap({
   jobId,
-  filePath,
-  originalName,
+  inputFile,
   mimeType,
   duration,
   format,
@@ -501,130 +864,342 @@ async function processRecap({
   aiVoice,
   subtitles
 }) {
+
+  const work =
+    path.join(
+      WORK_DIR,
+      jobId
+    );
+
+  fs.mkdirSync(
+    work,
+    { recursive: true }
+  );
+
   try {
 
-    jobs.set(jobId, {
-      ...jobs.get(jobId),
+    jobs.get(jobId).status =
+      "analyzing";
 
-      status: "uploading",
+    jobs.get(jobId).progress =
+      10;
 
-      progress: 10
-    });
+    /* -----------------------------------------------
+       1. Get source duration
+    ------------------------------------------------ */
 
-    /* Upload source video to JSON2Video */
+    const sourceDuration =
+      await ffprobeDuration(
+        inputFile
+      );
 
-    const sourceUrl =
-      await uploadToJSON2Video(
-        filePath,
-        originalName,
+    console.log(
+      "Source duration:",
+      sourceDuration
+    );
+
+    jobs.get(jobId).progress =
+      15;
+
+    /* -----------------------------------------------
+       2. Upload to Gemini
+    ------------------------------------------------ */
+
+    const videoFile =
+      await uploadVideoToGemini(
+        inputFile,
         mimeType
       );
 
-    jobs.set(jobId, {
-      ...jobs.get(jobId),
+    jobs.get(jobId).status =
+      "ai-analysis";
 
-      status: "creating",
-      progress: 25,
+    jobs.get(jobId).progress =
+      30;
 
-      sourceUrl
-    });
+    /* -----------------------------------------------
+       3. Gemini selects recap scenes
+    ------------------------------------------------ */
 
-    /* Create movie */
+    const analysis =
+      await analyzeVideo({
+        videoFile,
 
-    const projectId =
-      await createMovie({
-        sourceUrl,
-        duration,
-        format,
+        targetDuration:
+          duration,
+
         language,
+
         style,
-        aiVoice,
-        subtitles
+
+        sourceDuration
       });
 
-    jobs.set(jobId, {
-      ...jobs.get(jobId),
+    console.log(
+      "Recap title:",
+      analysis.title
+    );
 
-      status: "rendering",
-      progress: 35,
-
-      projectId
-    });
-
-    /* Wait for render */
-
-    const movie =
-      await waitForMovie(
-        projectId,
-        jobId
+    const clips =
+      normalizeClips(
+        analysis.clips,
+        sourceDuration,
+        duration
       );
 
-    jobs.set(jobId, {
-      ...jobs.get(jobId),
+    jobs.get(jobId).analysis =
+      analysis;
 
-      status: "completed",
-      progress: 100,
+    jobs.get(jobId).clips =
+      clips;
 
-      videoUrl: movie.url,
+    jobs.get(jobId).progress =
+      45;
 
-      summary:
-        createBasicText({
-          language,
-          style,
-          duration
-        }),
+    /* -----------------------------------------------
+       4. Cut selected scenes
+    ------------------------------------------------ */
 
-      script:
-        aiVoice
-          ? createBasicText({
-              language,
-              style,
-              duration
-            })
-          : "AI voice disabled.",
+    const clipFiles = [];
 
-      projectId,
+    for (
+      let i = 0;
+      i < clips.length;
+      i++
+    ) {
 
-      json2video: movie
-    });
+      const clip =
+        clips[i];
+
+      const clipFile =
+        path.join(
+          work,
+          `clip-${i}.mp4`
+        );
+
+      await createClip(
+        inputFile,
+        clipFile,
+        clip.start,
+        clip.end
+      );
+
+      clipFiles.push(
+        clipFile
+      );
+
+      jobs.get(jobId).progress =
+        45 +
+        Math.round(
+          (i + 1) /
+          clips.length *
+          25
+        );
+    }
+
+    /* -----------------------------------------------
+       5. Concatenate
+    ------------------------------------------------ */
+
+    const concatenated =
+      path.join(
+        work,
+        "recap-concat.mp4"
+      );
+
+    await concatClips(
+      clipFiles,
+      concatenated
+    );
+
+    jobs.get(jobId).progress =
+      75;
+
+    /* -----------------------------------------------
+       6. Format
+    ------------------------------------------------ */
+
+    const formatted =
+      path.join(
+        work,
+        "recap-formatted.mp4"
+      );
+
+    await formatVideo(
+      concatenated,
+      formatted,
+      format
+    );
+
+    jobs.get(jobId).progress =
+      82;
+
+    let finalVideo =
+      formatted;
+
+    /* -----------------------------------------------
+       7. Subtitles
+    ------------------------------------------------ */
+
+    if (
+      subtitles &&
+      Array.isArray(
+        analysis.narration
+      ) &&
+      analysis.narration.length
+    ) {
+
+      const srt =
+        createSrt(
+          analysis.narration,
+          clips
+        );
+
+      if (srt.trim()) {
+
+        const srtFile =
+          path.join(
+            work,
+            "subtitles.srt"
+          );
+
+        fs.writeFileSync(
+          srtFile,
+          srt,
+          "utf8"
+        );
+
+        const subtitled =
+          path.join(
+            work,
+            "recap-subtitled.mp4"
+          );
+
+        await burnSubtitles(
+          formatted,
+          srtFile,
+          subtitled,
+          format
+        );
+
+        finalVideo =
+          subtitled;
+      }
+    }
+
+    jobs.get(jobId).progress =
+      95;
+
+    /* -----------------------------------------------
+       8. Copy final video
+    ------------------------------------------------ */
+
+    const outputName =
+      `${jobId}.mp4`;
+
+    const outputFile =
+      path.join(
+        OUTPUT_DIR,
+        outputName
+      );
+
+    fs.copyFileSync(
+      finalVideo,
+      outputFile
+    );
+
+    jobs.get(jobId).videoUrl =
+      `/outputs/${outputName}`;
+
+    jobs.get(jobId).summary =
+      analysis.summary ||
+      "";
+
+    jobs.get(jobId).script =
+      Array.isArray(
+        analysis.narration
+      )
+        ? analysis.narration
+            .map(x => x.text)
+            .join(" ")
+        : "";
+
+    jobs.get(jobId).status =
+      "completed";
+
+    jobs.get(jobId).progress =
+      100;
+
+    console.log(
+      "RECAP COMPLETED:",
+      outputFile
+    );
 
   } catch (error) {
 
     console.error(
-      `[${jobId}]`,
+      "RECAP ERROR:",
       error
     );
 
-    jobs.set(jobId, {
-      ...jobs.get(jobId),
+    jobs.get(jobId).status =
+      "error";
 
-      status: "error",
-      progress: 100,
+    jobs.get(jobId).progress =
+      100;
 
-      error:
-        error?.message ||
-        String(error)
-    });
+    jobs.get(jobId).error =
+      error?.message ||
+      String(error);
 
   } finally {
 
     /*
-      Delete temporary upload from Render.
+      Remove uploaded source.
     */
 
     try {
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+      if (
+        fs.existsSync(
+          inputFile
+        )
+      ) {
+        fs.unlinkSync(
+          inputFile
+        );
       }
-    } catch {
-      // ignore cleanup errors
-    }
+    } catch {}
+
+    /*
+      Keep output but remove work files.
+    */
+
+    try {
+      fs.rmSync(
+        work,
+        {
+          recursive: true,
+          force: true
+        }
+      );
+    } catch {}
   }
 }
 
-/* -------------------------------------------------------
-   POST /api/recap
-------------------------------------------------------- */
+/* =====================================================
+   STATIC OUTPUTS
+===================================================== */
+
+app.use(
+  "/outputs",
+  express.static(
+    OUTPUT_DIR
+  )
+);
+
+/* =====================================================
+   CREATE RECAP
+===================================================== */
 
 app.post(
   "/api/recap",
@@ -633,78 +1208,114 @@ app.post(
 
     try {
 
-      if (!JSON2VIDEO_API_KEY) {
+      if (!GEMINI_API_KEY) {
+
+        if (req.file?.path) {
+          try {
+            fs.unlinkSync(
+              req.file.path
+            );
+          } catch {}
+        }
+
         return res.status(500).json({
           error:
-            "JSON2VIDEO_API_KEY is not configured on Render."
+            "GEMINI_API_KEY is not configured."
         });
       }
 
       if (!req.file) {
+
         return res.status(400).json({
-          error: "Please upload a video."
+          error:
+            "Please upload a video."
         });
       }
 
-      const jobId = makeId();
+      const jobId =
+        makeId();
 
       const requestedDuration =
-        Number(req.body.duration || 30);
+        Number(
+          req.body.duration || 30
+        );
 
       const duration =
-        [30, 60, 90].includes(requestedDuration)
+        [30, 60, 90].includes(
+          requestedDuration
+        )
           ? requestedDuration
           : 30;
 
       const format =
-        req.body.format || "9:16";
+        req.body.format ||
+        "9:16";
 
       const language =
-        req.body.language || "English";
+        req.body.language ||
+        "English";
 
       const style =
-        req.body.style || "cinematic";
+        req.body.style ||
+        "cinematic";
 
       const aiVoice =
-        String(req.body.aiVoice) === "true";
+        String(
+          req.body.aiVoice
+        ) === "true";
 
       const subtitles =
-        String(req.body.subtitles) === "true";
+        String(
+          req.body.subtitles
+        ) === "true";
 
-      jobs.set(jobId, {
+      jobs.set(
         jobId,
+        {
+          jobId,
 
-        status: "queued",
+          status:
+            "queued",
 
-        progress: 0,
+          progress:
+            0,
 
-        videoUrl: null,
+          videoUrl:
+            null,
 
-        summary: null,
+          summary:
+            null,
 
-        script: null,
+          script:
+            null,
 
-        error: null,
+          error:
+            null,
 
-        createdAt: Date.now()
-      });
+          createdAt:
+            Date.now()
+        }
+      );
 
       res.json({
-        success: true,
+        success:
+          true,
 
         jobId,
 
         message:
-          "Video uploaded. JSON2Video rendering started."
+          "AI video recap started."
       });
+
+      /*
+        Run in background.
+      */
 
       processRecap({
         jobId,
 
-        filePath: req.file.path,
-
-        originalName:
-          req.file.originalname,
+        inputFile:
+          req.file.path,
 
         mimeType:
           req.file.mimetype,
@@ -724,123 +1335,137 @@ app.post(
 
     } catch (error) {
 
-      console.error(error);
+      console.error(
+        error
+      );
 
       if (req.file?.path) {
+
         try {
-          fs.unlinkSync(req.file.path);
+          fs.unlinkSync(
+            req.file.path
+          );
         } catch {}
       }
 
-      res.status(500).json({
+      return res.status(500).json({
         error:
           error?.message ||
-          "Failed to create recap."
+          "Failed to start recap."
       });
     }
   }
 );
 
-/* -------------------------------------------------------
-   GET /api/recap/status/:jobId
-------------------------------------------------------- */
+/* =====================================================
+   STATUS
+===================================================== */
 
 app.get(
   "/api/recap/status/:jobId",
   (req, res) => {
 
     const job =
-      jobs.get(req.params.jobId);
+      jobs.get(
+        req.params.jobId
+      );
 
     if (!job) {
+
       return res.status(404).json({
-        error: "Job not found."
+        error:
+          "Job not found."
       });
     }
 
     res.json({
-      success: true,
+      success:
+        true,
 
-      jobId: job.jobId,
+      jobId:
+        job.jobId,
 
-      status: job.status,
+      status:
+        job.status,
 
       progress:
-        job.progress ?? 0,
+        job.progress || 0,
 
       videoUrl:
-        job.videoUrl || null,
+        job.videoUrl
+          ? `${req.protocol}://${req.get("host")}${job.videoUrl}`
+          : null,
 
       summary:
-        job.summary || null,
+        job.summary,
 
       script:
-        job.script || null,
+        job.script,
 
       error:
-        job.error || null,
-
-      projectId:
-        job.projectId || null
+        job.error
     });
   }
 );
 
-/* -------------------------------------------------------
-   Health
-------------------------------------------------------- */
+/* =====================================================
+   HEALTH
+===================================================== */
 
-app.get("/", (req, res) => {
+app.get(
+  "/",
+  (req, res) => {
 
-  res.json({
-    ok: true,
+    res.json({
+      ok:
+        true,
 
-    service:
-      "OneClick Recap AI",
+      service:
+        "OneClick Recap AI",
 
-    version:
-      "3.0.0-json2video",
+      version:
+        "4.0.0-gemini",
 
-    engine:
-      "JSON2Video",
+      engine:
+        "Gemini + FFmpeg",
 
-    openai:
-      false,
+      openai:
+        false,
 
-    json2video:
-      Boolean(JSON2VIDEO_API_KEY)
-  });
-});
+      json2video:
+        false,
 
-/* -------------------------------------------------------
-   404
-------------------------------------------------------- */
+      gemini:
+        Boolean(
+          GEMINI_API_KEY
+        )
+    });
+  }
+);
 
-app.use((req, res) => {
+/* =====================================================
+   ERROR HANDLER
+===================================================== */
 
-  res.status(404).json({
-    error: "Not found"
-  });
-});
+app.use(
+  (error, req, res, next) => {
 
-/* -------------------------------------------------------
-   Error handler
-------------------------------------------------------- */
+    console.error(
+      "SERVER ERROR:",
+      error
+    );
 
-app.use((error, req, res, next) => {
+    res.status(500).json({
+      error:
+        error?.message ||
+        "Server error"
+    });
+  }
+);
 
-  console.error(error);
-
-  res.status(500).json({
-    error:
-      error?.message ||
-      "Server error"
-  });
-});
-
-/* -------------------------------------------------------
-   Start
-------------------------------------------------------- */
+/* =====================================================
+   START
+===================================================== */
 
 app.listen(
   PORT,
@@ -848,11 +1473,22 @@ app.listen(
   () => {
 
     console.log(
-      `OneClick Recap JSON2Video server running on port ${PORT}`
+      `OneClick Recap 4.0 running on port ${PORT}`
     );
 
     console.log(
-      `JSON2Video configured: ${Boolean(JSON2VIDEO_API_KEY)}`
+      "Gemini configured:",
+      Boolean(GEMINI_API_KEY)
+    );
+
+    console.log(
+      "OpenAI:",
+      false
+    );
+
+    console.log(
+      "JSON2Video:",
+      false
     );
   }
 );
